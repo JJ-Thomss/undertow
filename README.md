@@ -39,61 +39,38 @@ are current:
 To keep a song, add it to your library or one of your own playlists before the
 week is up. The Undertow playlists themselves are replaced.
 
-## Setup (once, on your Mac, about 10 minutes)
+## Setup (once, on your Mac)
 
-1. Install the `uv` tool runner, then Undertow:
+Open Terminal and run these two commands. The second one walks you through
+everything, pausing where it needs you:
 
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
+```bash
+git clone -b claude/peaceful-ride-50sue4 https://github.com/JJ-Thomss/undertow.git ~/undertow-src
+```
 
-   ```bash
-   git clone -b claude/peaceful-ride-50sue4 https://github.com/JJ-Thomss/undertow.git ~/undertow-src
-   ```
+```bash
+~/undertow-src/setup.sh
+```
 
-   ```bash
-   uv tool install ~/undertow-src
-   ```
+What the script does, in order:
 
-2. In Safari, sign in at [music.apple.com](https://music.apple.com). Then turn
-   on Safari > Settings > Advanced > "Show features for web developers", and in
-   the Develop menu tick "Allow JavaScript from Apple Events". You can untick
-   it again after the next step.
+1. Installs `uv` (a tool runner that gives Undertow its own Python) and Undertow.
+2. Asks you to sign in at [music.apple.com](https://music.apple.com) in Safari
+   and switch on two Safari settings: Settings > Advanced > "Show features for
+   web developers", then Develop > "Allow JavaScript from Apple Events". You
+   can switch the second one off again afterwards.
+3. Runs `undertow login`, then `undertow doctor`. macOS asks whether Terminal
+   may control Music: allow it. `doctor` prints the artists it thinks are your
+   favourites. If that list looks wrong, answer "n" at the next question.
+4. Asks before creating anything, then runs `undertow run` to build the first
+   playlists and `undertow schedule install` to switch on the weekly rotation.
+   macOS asks once more whether "python" may control Music: that is the
+   scheduled job asking for itself. Allow it.
 
-3. Sign Undertow in and check everything:
-
-   ```bash
-   undertow login
-   ```
-
-   ```bash
-   undertow doctor
-   ```
-
-   The first time, macOS asks whether Terminal may control Music. Allow it.
-   `doctor` prints the artists it thinks are your favourites; if that list
-   looks wrong, stop and tell me before going further.
-
-4. Look before anything is created:
-
-   ```bash
-   undertow preview
-   ```
-
-5. Create the first set and switch on the weekly rotation:
-
-   ```bash
-   undertow run
-   ```
-
-   ```bash
-   undertow schedule install
-   ```
-
-The first `preview` or `run` is slow (expect half an hour or more), because
-Apple's free catalogue lookup pauses callers for a few minutes after a burst
-of requests. Undertow waits those pauses out. Results are saved, so later runs
-are quicker. Leave it running; the scheduled runs happen in the background.
+The first run is slow (expect half an hour or more), because Apple's free
+catalogue lookup pauses callers for a few minutes after a burst of requests.
+Undertow waits those pauses out. Results are saved, so later runs are quicker.
+To see the picks without creating anything, run `undertow preview`.
 
 ## Everyday use
 
@@ -102,7 +79,7 @@ are quicker. Leave it running; the scheduled runs happen in the background.
 | `undertow status` | Last rotation, live playlists, how many recommendations you have saved |
 | `undertow run --force` | Rotate now instead of waiting |
 | `undertow preview --reroll 2` | See a different selection without changing anything |
-| `undertow cleanup` | List Undertow playlists left by earlier setups; add `--delete` to remove them |
+| `undertow cleanup` | List playlists left by earlier setups; add `--delete` to go through them one by one |
 | `undertow schedule remove` | Stop the automatic rotation |
 
 Settings are in `~/.undertow/config.toml`: rotation length, playlist size,
@@ -112,14 +89,16 @@ report of each rotation, with the reason for every song, is written to
 
 ## How deletion stays safe
 
-- Undertow deletes only playlists it created itself. It records each
-  playlist's ID when it makes it and deletes by that ID, never by searching
-  for a name.
-- New playlists are created first. The old set is deleted only after that
-  succeeds, so a failed run leaves last week's playlists in place.
+- Undertow deletes only playlists it created itself. It writes each
+  playlist's ID to disk the moment the playlist exists and deletes by that ID,
+  never by searching for a name.
+- New playlists are created first. An old playlist is deleted only once its
+  replacement exists. If a run fails outright, last week's set stays. If only
+  some playlists could be made, only those are replaced, and you are told.
+- A playlist that fails halfway through being made is removed straight away.
 - A playlist that could not be deleted is reported and retried next time.
 - Playlists from earlier setups are never touched unless you run
-  `undertow cleanup --delete` and type `delete` to confirm.
+  `undertow cleanup --delete` and answer yes for each one.
 
 ## How it works, and its limits
 

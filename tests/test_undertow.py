@@ -7,7 +7,8 @@ from undertow import library, taste as taste_mod
 from undertow.applemusic import AppleMusic, AppleMusicError, NotSignedIn
 from undertow.config import Config
 from undertow.library import Track, norm_artist, norm_title, track_key
-from undertow.recommend import Pick, Plan, Recommender, is_variant, weighted_sample
+from undertow.recommend import (Pick, Plan, Recommender, is_seasonal, is_variant,
+                                is_variant_album, weighted_sample)
 from undertow.rotate import apply_rotation
 from undertow.schedule import build_plist
 from undertow.sources import Song
@@ -27,13 +28,32 @@ def test_normalisation_matches_the_same_song_across_spellings():
     assert norm_artist("Simon & Garfunkel") == "simon and garfunkel"
 
 
+def test_titles_with_ordinary_words_survive_normalisation():
+    assert norm_title("With or Without You") == "with or without you"
+    assert norm_title("Stay With Me") != norm_title("Stay")
+    assert norm_title("Song (with Friend)") == norm_title("Song (feat. X)") == "song"
+    assert norm_artist("With Confidence") == "with confidence"
+
+
+def test_non_latin_and_symbol_names_keep_their_identity():
+    assert norm_artist("米津玄師") == "米津玄師"
+    assert norm_artist("Молчат Дома") == "молчат дома"
+    assert norm_artist("!!!") == "!!!" != norm_artist("???")
+    assert norm_artist("MØ") == "mo"
+
+
 def test_variant_filter_only_reads_decorations():
     assert not is_variant("Live Forever")
     assert not is_variant("Mixed Emotions")
+    assert not is_variant("Live in the Moment")
     assert is_variant("Creep (Live)")
     assert is_variant("Song - Radio Edit")
-    assert is_variant("Live at Leeds")
-    assert not is_variant("Blue (Deluxe Edition)")
+    assert is_variant_album("Live at Leeds")
+    assert is_variant_album("MTV Unplugged (Live)")
+    # Often the only edition Apple carries; its songs are the normal recordings.
+    assert not is_variant_album("Blue (Deluxe Version)")
+    assert not is_variant_album("1989 (Taylor's Version)")
+    assert is_seasonal("On This Christmas", "") and not is_seasonal("Holiday", "Blue")
 
 
 def test_parse_dump_keeps_songs_only_and_reads_dates():
@@ -225,35 +245,59 @@ def test_rotation_is_due_weekly_and_state_survives_reload(tmp_path):
 # --- rotation ------------------------------------------------------------
 
 class FakeClient:
-    def __init__(self, fail_create=(), fail_delete=()):
+    """Stands in for Apple Music. `fail` maps a step name to playlist-name
+    fragments (or ids, for delete) that should fail at that step."""
+
+    def __init__(self, **fail):
         self.calls, self.live = [], {"stranger": "My Own Playlist"}
-        self.fail_create, self.fail_delete = set(fail_create), set(fail_delete)
+        self.fail = {k: set(v) for k, v in fail.items()}
+        self.error = AppleMusicError
         self.n = 0
+
+    def _maybe_fail(self, step, subject):
+        if any(f in subject for f in self.fail.get(step, ())):
+            raise self.error(f"{step} failed")
+
+    def storefront(self):
+        return "ca"
 
     def ensure_folder(self, name):
         self.calls.append(("folder", name))
         return "f1"
 
-    def create_playlist(self, name, description, folder_id, song_ids):
-        if any(f in name for f in self.fail_create):
-            raise AppleMusicError("boom")
+    def create_playlist(self, name, description):
+        self._maybe_fail("create", name)
         self.n += 1
         pid = f"p{self.n}"
         self.live[pid] = name
-        self.calls.append(("create", name, folder_id, tuple(song_ids)))
-        return pid, len(song_ids)
+        self.calls.append(("create", pid, name))
+        return pid
+
+    def move_to_folder(self, pid, folder_id):
+        self._maybe_fail("move", self.live[pid])
+        self.calls.append(("move", pid, folder_id))
+
+    def add_songs(self, pid, song_ids):
+        self._maybe_fail("add", self.live[pid])
+        self.calls.append(("add", pid, tuple(song_ids)))
+
+    def confirm_tracks(self, pid, expected):
+        return expected
 
     def delete_playlist(self, pid):
-        if pid in self.fail_delete:
-            raise AppleMusicError("nope")
+        self._maybe_fail("delete", pid)
         self.calls.append(("delete", pid))
         self.live.pop(pid, None)
 
 
 def plans_for(*kinds, n=6):
     titles = {"kindred": "Kindred", "fresh": "Fresh"}
-    return [Plan(k, titles[k], [Pick(song(f"{k}{i}", f"T{i}"), "why", ["alpha"]) for i in range(n)])
-            for k in kinds]
+    return [Plan(k, titles[k], [Pick(song(f"{k}{i}", f"T{i}"), "why", ["alpha"], f"{k}{i}|t{i}", f"{k}{i}")
+                                for i in range(n)]) for k in kinds]
+
+
+def recorded_ids(state):
+    return [p["id"] for g in state.data["generations"] for p in g["playlists"]]
 
 
 def test_rotation_creates_new_then_deletes_only_its_own_old_playlists(tmp_path):
@@ -261,44 +305,95 @@ def test_rotation_creates_new_then_deletes_only_its_own_old_playlists(tmp_path):
     first = apply_rotation(plans_for("kindred", "fresh"), cfg, state, client, NOW)
     assert [p["name"] for p in first.created] == ["Kindred · Nov 12", "Fresh · Nov 12"]
     assert first.deleted == []
+    assert ("move", "p1", "f1") in client.calls and len(client.calls[3][2]) == 6
 
     later = NOW + timedelta(days=7)
     client.calls.clear()
     second = apply_rotation(plans_for("kindred", "fresh"), cfg, state, client, later)
-    kinds = [c[0] for c in client.calls]
-    assert kinds == ["folder", "create", "create", "delete", "delete"]  # new before old goes
+    steps = [c[0] for c in client.calls]
+    assert steps.index("delete") > max(i for i, s in enumerate(steps) if s == "add")  # new first
     assert sorted(second.deleted) == ["Fresh · Nov 12", "Kindred · Nov 12"]
     assert sorted(client.live.values()) == ["Fresh · Nov 19", "Kindred · Nov 19", "My Own Playlist"]
-    assert len(state.data["generations"]) == 1
+    assert recorded_ids(state) == ["p3", "p4"]
     assert state.last_rotation() == later
     old = [h for h in state.data["history"] if h["date"] == NOW.isoformat()]
     assert len(old) == 12 and all(h["closed"] for h in old)
-    assert all("stranger" != c[1] for c in client.calls if c[0] == "delete")
+    assert {c[1] for c in client.calls if c[0] == "delete"} == {"p1", "p2"}  # never the stranger
 
 
 def test_failed_rotation_keeps_last_weeks_playlists(tmp_path):
-    cfg, state = Config(), State(tmp_path / "s.json")
-    client = FakeClient()
+    cfg, state, client = Config(), State(tmp_path / "s.json"), FakeClient()
     apply_rotation(plans_for("kindred"), cfg, state, client, NOW)
-    client.fail_create = {"Kindred"}
+    client.fail = {"create": {"Kindred"}}
     out = apply_rotation(plans_for("kindred"), cfg, state, client, NOW + timedelta(days=7))
     assert not out.created and not out.deleted
     assert "Kindred · Nov 12" in client.live.values()
     assert state.last_rotation() == NOW  # still due, so it retries tomorrow
+    assert recorded_ids(state) == ["p1"]
+
+
+def test_only_replaced_playlists_are_deleted_on_partial_success(tmp_path):
+    cfg, state, client = Config(), State(tmp_path / "s.json"), FakeClient()
+    apply_rotation(plans_for("kindred", "fresh"), cfg, state, client, NOW)
+    client.fail = {"create": {"Fresh"}}
+    out = apply_rotation(plans_for("kindred", "fresh"), cfg, state, client, NOW + timedelta(days=7))
+    assert out.deleted == ["Kindred · Nov 12"]
+    assert out.kept == ["Fresh · Nov 12"]           # no replacement, so it stays
+    assert sorted(client.live.values()) == ["Fresh · Nov 12", "Kindred · Nov 19", "My Own Playlist"]
+    # Next week Fresh is made again and the two-week-old one finally goes.
+    client.fail = {}
+    out = apply_rotation(plans_for("kindred", "fresh"), cfg, state, client, NOW + timedelta(days=14))
+    assert sorted(out.deleted) == ["Fresh · Nov 12", "Kindred · Nov 19"]
+
+
+def test_half_made_playlist_is_removed_and_never_orphaned(tmp_path):
+    cfg, state = Config(), State(tmp_path / "s.json")
+    client = FakeClient(add={"Kindred"})
+    out = apply_rotation(plans_for("kindred", "fresh"), cfg, state, client, NOW)
+    assert [p["kind"] for p in out.created] == ["fresh"]
+    assert "Kindred · Nov 12" not in client.live.values()   # created, then cleaned up
+    assert recorded_ids(state) == ["p2"]
+    assert not any(h["kind"] == "kindred" for h in state.data["history"])
+
+    # If the clean-up delete fails too, the id stays recorded and goes next time.
+    state2 = State(tmp_path / "s2.json")
+    client2 = FakeClient(add={"Kindred"}, delete={"p1"})
+    apply_rotation(plans_for("kindred", "fresh"), cfg, state2, client2, NOW)
+    assert recorded_ids(state2) == ["p1", "p2"]
+    assert State(tmp_path / "s2.json").data["generations"][0]["playlists"][0]["failed"]
+    client2.fail = {}
+    out = apply_rotation(plans_for("fresh"), cfg, state2, client2, NOW + timedelta(days=7))
+    assert "Kindred · Nov 12" in out.deleted and "p1" not in client2.live
 
 
 def test_undeletable_playlist_is_kept_on_the_books_for_retry(tmp_path):
-    cfg, state = Config(), State(tmp_path / "s.json")
-    client = FakeClient()
+    cfg, state, client = Config(), State(tmp_path / "s.json"), FakeClient()
     apply_rotation(plans_for("kindred"), cfg, state, client, NOW)
-    client.fail_delete = {"p1"}
-    out = apply_rotation(plans_for("kindred"), cfg, state, client, NOW + timedelta(days=7),
-                         delete_by_name=lambda name: (False, ""))
+    client.fail = {"delete": {"p1"}}
+    out = apply_rotation(plans_for("kindred"), cfg, state, client, NOW + timedelta(days=7))
     assert out.undeleted == ["Kindred · Nov 12"]
-    assert [g["playlists"][0]["id"] for g in state.data["generations"]] == ["p1", "p2"]
-    client.fail_delete = set()
+    assert recorded_ids(state) == ["p1", "p2"]
+    client.fail = {}
     out = apply_rotation(plans_for("kindred"), cfg, state, client, NOW + timedelta(days=14))
     assert sorted(out.deleted) == ["Kindred · Nov 12", "Kindred · Nov 19"]
+
+
+def test_expired_sign_in_stops_the_run_and_says_so(tmp_path):
+    cfg, state, client = Config(), State(tmp_path / "s.json"), FakeClient()
+    apply_rotation(plans_for("kindred"), cfg, state, client, NOW)
+    client.fail, client.error = {"create": {"Kindred"}}, NotSignedIn
+    with pytest.raises(NotSignedIn):
+        apply_rotation(plans_for("kindred"), cfg, state, client, NOW + timedelta(days=7))
+    assert recorded_ids(state) == ["p1"] and "p1" in client.live   # nothing lost, nothing deleted
+    assert State(tmp_path / "s.json").last_rotation() == NOW
+
+
+def test_playlist_type_switched_off_in_settings_is_cleared_out(tmp_path):
+    state, client = State(tmp_path / "s.json"), FakeClient()
+    apply_rotation(plans_for("kindred", "fresh"), Config(), state, client, NOW)
+    cfg = Config(playlists=["kindred"])
+    out = apply_rotation(plans_for("kindred"), cfg, state, client, NOW + timedelta(days=7))
+    assert sorted(out.deleted) == ["Fresh · Nov 12", "Kindred · Nov 12"]
 
 
 def test_thin_playlists_are_skipped(tmp_path):
@@ -326,7 +421,10 @@ class FakeSession:
         self.log.append((method, url.replace("https://amp-api.music.apple.com", ""), kw.get("json")))
         assert headers["Authorization"] == "Bearer WEB" and headers["Music-User-Token"] == "USER"
         assert headers["Origin"] == "https://music.apple.com"
-        return self.script.pop(0)
+        step = self.script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
 
 
 def client_with(script):
@@ -334,43 +432,79 @@ def client_with(script):
     return AppleMusic(tokens=lambda: ("WEB", "USER"), session=session, sleep=lambda s: None), session
 
 
-def test_create_playlist_goes_into_the_folder_with_its_songs():
+def test_playlist_is_created_moved_and_filled_with_the_tested_requests():
     client, session = client_with([
         Resp(200, {"data": [{"id": "fX", "type": "library-playlist-folders",
                              "attributes": {"name": "undertow"}}]}),
-        Resp(201, {"data": [{"id": "p.new"}]}),
-        Resp(204),
-        Resp(200, {"data": [{"id": "p.new", "type": "library-playlists", "attributes": {"name": "K"}}]}),
-        Resp(200, {"data": [{}, {}]}),
+        Resp(201, {"data": [{"id": "p.new"}]}), Resp(204), Resp(204),
+        Resp(404), Resp(200, {"data": [{}, {}]}),
     ])
     folder = client.ensure_folder("Undertow")  # found case-insensitively, not recreated
-    pid, confirmed = client.create_playlist("K", "desc", folder, ["11", "22"])
-    assert (folder, pid, confirmed) == ("fX", "p.new", 2)
-    method, path, body = session.log[1]
-    assert (method, path) == ("POST", "/v1/me/library/playlists")
-    assert body["relationships"]["parent"]["data"] == [{"id": "fX", "type": "library-playlist-folders"}]
-    assert session.log[2][1] == "/v1/me/library/playlists/p.new/tracks"
-    assert session.log[2][2] == {"data": [{"id": "11", "type": "songs"}, {"id": "22", "type": "songs"}]}
+    pid = client.create_playlist("K", "desc")
+    client.move_to_folder(pid, folder)
+    client.add_songs(pid, ["11", "22"])
+    assert client.confirm_tracks(pid, 2) == 2          # first look 404s: not visible yet
+    assert session.log[1] == ("POST", "/v1/me/library/playlists",
+                              {"attributes": {"name": "K", "description": "desc"}})
+    assert session.log[2] == ("PUT", "/v1/me/library/playlists/p.new/parent",
+                              {"data": [{"id": "fX", "type": "library-playlist-folders"}]})
+    assert session.log[3] == ("POST", "/v1/me/library/playlists/p.new/tracks",
+                              {"data": [{"id": "11", "type": "songs"}, {"id": "22", "type": "songs"}]})
 
 
 def test_folder_is_created_when_missing():
-    client, session = client_with([Resp(200, {"data": []}), Resp(201, {"data": [{"id": "fNew"}]})])
+    client, session = client_with([Resp(404), Resp(201, {"data": [{"id": "fNew"}]})])
     assert client.ensure_folder("Undertow") == "fNew"
     assert session.log[1][2]["attributes"] == {"name": "Undertow"}
 
 
-def test_delete_treats_missing_as_done_and_expired_login_is_explicit():
-    client, session = client_with([Resp(404), Resp(401)])
+def test_a_post_is_never_sent_twice_but_reads_and_deletes_retry():
+    import requests
+
+    client, session = client_with([Resp(502)])
+    with pytest.raises(AppleMusicError):
+        client.create_playlist("K", "d")
+    assert len(session.log) == 1                       # a 502 may mean it was created
+    client, session = client_with([requests.exceptions.ReadTimeout()])
+    with pytest.raises(AppleMusicError):
+        client.add_songs("p1", ["1"])
+    assert len(session.log) == 1
+    client, session = client_with([Resp(429), Resp(201, {"data": [{"id": "p9"}]})])
+    assert client.create_playlist("K", "d") == "p9"   # 429 means it was refused: safe to resend
+    client, session = client_with([Resp(503), Resp(204)])
+    client.delete_playlist("p1")
+    assert len(session.log) == 2
+
+
+def test_delete_treats_missing_as_done_and_bad_answers_are_explicit():
+    client, session = client_with([Resp(404), Resp(401), Resp(201, {"oops": 1})])
     client.delete_playlist("p.gone")
     assert session.log[0][:2] == ("DELETE", "/v1/me/library/playlists/p.gone")
     with pytest.raises(NotSignedIn, match="undertow login"):
         client.delete_playlist("p.x")
+    with pytest.raises(AppleMusicError, match="unexpected format"):
+        client.create_playlist("K", "d")
+
+
+def test_settings_reject_wrong_types(tmp_path):
+    from undertow import config
+
+    path = tmp_path / "config.toml"
+    path.write_text('rotation_days = "7"\n')
+    with pytest.raises(ValueError, match="rotation_days"):
+        config.load(path)
+    path.write_text("playlists = []\n")
+    with pytest.raises(ValueError, match="at least one"):
+        config.load(path)
+    path.write_text("rotation_days = 14\nitunes_interval = 4\n")
+    assert config.load(path).rotation_days == 14
 
 
 def test_schedule_runs_this_install_daily():
     plist = build_plist(6, 30)
     assert plist["ProgramArguments"][1:] == ["-m", "undertow", "run"]
     assert plist["StartCalendarInterval"] == {"Hour": 6, "Minute": 30}
+    assert plist["EnvironmentVariables"]["UNDERTOW_SCHEDULED"] == "1"
 
 
 # --- the whole command, end to end with stand-ins --------------------------
@@ -398,7 +532,6 @@ def test_run_command_rotates_and_then_waits_until_due(tmp_path, monkeypatch, cap
     monkeypatch.setenv("UNDERTOW_HOME", str(home))
 
     client = FakeClient()
-    client.storefront = lambda: "ca"
     itunes = FakeITunes()
     extras = [f"N{i}" for i in range(4, 12)]  # enough unknown artists for two rotations
     for extra in extras:
@@ -413,8 +546,8 @@ def test_run_command_rotates_and_then_waits_until_due(tmp_path, monkeypatch, cap
         pass
     out = capsys.readouterr().out
     assert "Created  Kindred" in out
-    created = [c for c in client.calls if c[0] == "create"]
-    assert len(created) == 1 and len(created[0][3]) == 3
+    added = [c for c in client.calls if c[0] == "add"]
+    assert len(added) == 1 and len(added[0][2]) == 3
     assert list((home / "reports").glob("*.md"))
 
     assert cli.main(["run", "--library-json", str(lib)]) == 0   # same day: nothing to do
@@ -427,3 +560,41 @@ def test_run_command_rotates_and_then_waits_until_due(tmp_path, monkeypatch, cap
         del FakeDeezer.RELATED["Alpha"][-len(extras):]
     assert [c[0] for c in client.calls].count("delete") == 1     # the first set was removed
     assert len(client.live) == 2                                 # new playlist + the stranger
+
+
+# --- fixes from review -----------------------------------------------------
+
+def test_owned_collaboration_is_not_recommended_under_the_solo_name(tmp_path):
+    taste = make_taste()
+    taste.track_keys.add(track_key("Beta & Friend", "Joint Song"))
+    state = State(tmp_path / "s.json")
+    state.data["history"] = [{"key": "x|y", "artist_key": "x", "kind": "kindred", "seeds": [],
+                              "song_id": "Beta-Seen Before", "date": "2020-01-01", "generation": "g"}]
+    rec = Recommender(taste, Config(), state, FakeDeezer(), FakeITunes(), NOW, random.Random(1))
+    joint = song("Beta", "Joint Song")
+    joint.artist = "Beta & Friend"                       # how Apple credits it
+    seen = song("Beta", "Seen Before")                   # same catalogue id as in history
+    fine = song("Beta", "Fine")
+    assert [s.title for s in rec.eligible([joint, seen, fine], "Beta")] == ["Fine"]
+
+
+def test_a_dead_data_source_stops_the_run_instead_of_grinding_on(tmp_path):
+    from undertow.sources import SourceDown
+
+    class DeadITunes(FakeITunes):
+        def artist_id(self, name):
+            raise SourceDown("itunes kept refusing requests")
+
+    state = State(tmp_path / "s.json")
+    rec = Recommender(make_taste(), Config(seeds_per_run=5), state, FakeDeezer(), DeadITunes(),
+                      NOW, random.Random(1))
+    with pytest.raises(SourceDown):
+        rec.run()
+
+
+def test_library_read_errors_are_not_mistaken_for_an_empty_library():
+    # Every property except the favourite/dislike flags must raise on failure.
+    script = library._DUMP_JXA
+    assert "const get = (prop) => tracks[prop]();" in script
+    assert "favorited: opt('favorited') || opt('loved')" in script
+    assert "playedCount: get('playedCount')" in script

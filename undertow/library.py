@@ -16,7 +16,10 @@ _DUMP_JXA = r"""
 function run() {
   const music = Application('Music');
   const tracks = music.libraryPlaylists[0].tracks;
-  const get = (prop) => { try { return tracks[prop](); } catch (e) { return null; } };
+  // Errors must surface (a refused permission would otherwise look like an
+  // empty library). Only the favourite flag may be missing: its name changed.
+  const get = (prop) => tracks[prop]();
+  const opt = (prop) => { try { return tracks[prop](); } catch (e) { return null; } };
   return JSON.stringify({
     name: get('name'),
     artist: get('artist'),
@@ -25,8 +28,8 @@ function run() {
     genre: get('genre'),
     playedCount: get('playedCount'),
     skippedCount: get('skippedCount'),
-    favorited: get('favorited') || get('loved'),
-    disliked: get('disliked'),
+    favorited: opt('favorited') || opt('loved'),
+    disliked: opt('disliked'),
     dateAdded: get('dateAdded'),
     playedDate: get('playedDate'),
     mediaKind: get('mediaKind'),
@@ -53,26 +56,44 @@ class LibraryError(RuntimeError):
     pass
 
 
-_FEAT = re.compile(r"\s*[\(\[]?\s*\b(feat\.?|featuring|ft\.?|with)\b.*$", re.I)
+# A feature credit: "(feat. X)", "(with X)" in brackets, or " feat. X" after the
+# name. A bare "with" is an ordinary word ("Stay With Me") and is left alone.
+_FEAT = re.compile(
+    r"(?<=\S)\s*[\(\[]\s*(feat\.?|featuring|ft\.?|with)\b.*$"
+    r"|(?<=\S)\s+(feat\.?|featuring|ft\.?)\s.*$",
+    re.I,
+)
 _BRACKETS = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]")
 _DASH_SUFFIX = re.compile(
     r"\s+-\s+.*\b(remaster(ed)?|version|edit|mix|mono|stereo|single|deluxe|bonus|anniversary)\b.*$",
     re.I,
 )
-_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_NON_ALNUM = re.compile(r"[\W_]+")  # Unicode-aware: keeps letters of every script
+_LETTERS = str.maketrans({"ø": "o", "æ": "ae", "œ": "oe", "ð": "d", "đ": "d", "ł": "l",
+                          "ß": "ss", "þ": "th"})
 
 
 def _fold(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text or "")
-    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
-    return text.replace("&", " and ")
+    """Lower-case and strip accents from Latin letters only, so 'Beyoncé' matches
+    'Beyonce' while Japanese, Cyrillic and other scripts keep their letters."""
+    out = []
+    for ch in unicodedata.normalize("NFC", text or "").casefold():
+        base = unicodedata.normalize("NFD", ch)
+        out.append(base[0] if len(base) > 1 and "a" <= base[0] <= "z" else ch)
+    return "".join(out).translate(_LETTERS).replace("&", " and ")
+
+
+def _clean(text: str, original: str) -> str:
+    cleaned = _NON_ALNUM.sub(" ", text).strip()
+    # Names made only of symbols ("!!!") must not all collapse to nothing.
+    return cleaned or " ".join((original or "").casefold().split())
 
 
 def norm_artist(name: str) -> str:
     """Comparable artist name: 'Beyoncé feat. JAY-Z' -> 'beyonce'."""
     text = _FEAT.sub("", _fold(name))
     text = re.sub(r"^the\s+", "", text.strip())
-    return _NON_ALNUM.sub(" ", text).strip()
+    return _clean(text, name)
 
 
 def norm_title(title: str) -> str:
@@ -81,7 +102,7 @@ def norm_title(title: str) -> str:
     text = _DASH_SUFFIX.sub("", text)
     text = _BRACKETS.sub("", text)
     text = _FEAT.sub("", text)
-    return _NON_ALNUM.sub(" ", text).strip()
+    return _clean(text, title)
 
 
 def track_key(artist: str, title: str) -> str:
@@ -160,8 +181,9 @@ def read_music_app(timeout: int = 600) -> list[Track]:
         hint = ""
         if "-1743" in err or "Not authorized" in err:
             hint = (
-                " Allow it under System Settings > Privacy & Security > Automation "
-                "(tick Music for your terminal), then run this again."
+                " Allow it under System Settings > Privacy & Security > Automation: tick "
+                "Music for Terminal (or for python, if this was the scheduled run), then "
+                "run this again."
             )
         raise LibraryError(f"Could not read the Music library: {err}.{hint}")
     try:

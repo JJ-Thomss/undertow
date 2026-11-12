@@ -68,6 +68,8 @@ class Config:
             raise ValueError(
                 f"Unknown playlist type(s) {unknown} in config. Choose from {list(PLAYLIST_TITLES)}."
             )
+        if not self.playlists:
+            raise ValueError("playlists must list at least one playlist type")
         if not self.folder.strip():
             raise ValueError("folder must not be empty")
         if self.tracks_per_playlist < 1 or self.rotation_days < 1:
@@ -84,6 +86,10 @@ def load(path: Path | None = None) -> Config:
         if unknown:
             raise ValueError(f"Unknown setting(s) in {path}: {sorted(unknown)}")
         for key, value in data.items():
+            want = type(getattr(cfg, key))
+            ok = isinstance(value, (int, float)) if want is float else isinstance(value, want)
+            if not ok or (isinstance(value, bool) and want is not bool):
+                raise ValueError(f"{key} in {path} must be a {want.__name__}, not {value!r}")
             setattr(cfg, key, value)
     cfg.validate()
     return cfg

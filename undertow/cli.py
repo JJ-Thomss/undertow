@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -76,16 +77,28 @@ def cmd_preview(args) -> int:
     return 0
 
 
+def _scheduled_permission_check(state: State) -> None:
+    """Under launchd, macOS asks separately whether this job may control Music.
+    Trigger that question once, at install time, instead of at 6:30 some morning."""
+    if os.environ.get("UNDERTOW_SCHEDULED") and not state.data.get("scheduled_access"):
+        ok, _ = musicapp.ping()
+        if ok:
+            state.data["scheduled_access"] = True
+            state.save()
+
+
 def cmd_run(args) -> int:
     home = config.ensure_home()
     cfg = config.load()
     state = State(home / "state.json")
     now = _now()
     if not args.force and not state.due(now, cfg.rotation_days):
+        _scheduled_permission_check(state)
         _say(f"Not due yet (last rotation {state.last_rotation():%b %d}, "
              f"every {cfg.rotation_days} days). Use --force to rotate now.")
         return 0
     client = AppleMusic()
+    out = None
     try:
         store = client.storefront()  # fail on a dead sign-in before the slow part
         if store != cfg.storefront:
@@ -97,20 +110,27 @@ def cmd_run(args) -> int:
         _say(str(e))
         musicapp.notify("Undertow needs you to sign in", "Open Terminal and run: undertow login")
         return 2
-    except (AppleMusicError, library.LibraryError, SourceError) as e:
-        _say(f"Rotation failed: {e}")
+    except Exception as e:  # anything else: say so, never die silently in the background
+        _say(f"Rotation failed: {type(e).__name__}: {e}")
         musicapp.notify("Undertow could not rotate", str(e)[:120])
         return 1
     out.new_saves = new_saves
-    report = home / "reports" / f"{now:%Y-%m-%d}.md"
+    report = home / "reports" / f"{now:%Y-%m-%d-%H%M}.md"
     write_report(out, state, report, now)
     for pl in out.created:
-        note = "" if pl["confirmed"] == pl["tracks"] else f" (Apple confirmed {pl['confirmed']})"
+        if pl["confirmed"] is None:
+            note = " (added; not yet visible in the library to double-check)"
+        elif pl["confirmed"] < pl["tracks"]:
+            note = f" (Apple shows {pl['confirmed']} so far)"
+        else:
+            note = ""
         _say(f"Created  {pl['name']}: {pl['tracks']} songs{note}")
     for item in out.skipped:
         _say(f"Skipped  {item}")
     for name in out.deleted:
         _say(f"Deleted  {name}")
+    for name in out.kept:
+        _say(f"Kept     {name} (its replacement was not made)")
     for name in out.undeleted:
         _say(f"COULD NOT DELETE  {name} (will retry next rotation)")
     if not out.created:
@@ -118,13 +138,20 @@ def cmd_run(args) -> int:
         musicapp.notify("Undertow could not rotate", "No playlists were created. See the log.")
         return 1
     _say(f"Report: {report}")
+    if out.skipped or out.undeleted:
+        musicapp.notify("Undertow rotated with problems",
+                        f"{len(out.created)} playlists made; see {report.name}.")
+        return 1
     musicapp.notify("Undertow", f"{len(out.created)} new playlists are in your {cfg.folder} folder.")
     return 0
 
 
 def cmd_login(args) -> int:
     _say("Signing in through Safari. If this stops with instructions, follow them and rerun.")
-    return subprocess.call([sys.executable, "-m", "applemusic_mcp", "login"])
+    code = subprocess.call([sys.executable, "-m", "applemusic_mcp", "login"])
+    if code != 0:
+        _say("\nWhere the text above says 'applemusic-mcp login', run this instead: undertow login")
+    return code
 
 
 def cmd_status(args) -> int:
@@ -183,9 +210,14 @@ def cmd_doctor(args) -> int:
 
 def cmd_schedule(args) -> int:
     if args.action == "install":
-        path = schedule.install(args.hour, args.minute)
+        config.ensure_home()
+        cfg = config.load()
+        due = State(config.home() / "state.json").due(_now(), cfg.rotation_days)
+        path = schedule.install(args.hour, args.minute, kick=not due)
         _say(f"Installed {path}. Undertow checks every day at "
              f"{args.hour:02d}:{args.minute:02d} and rotates when due.")
+        _say("If macOS now asks whether 'python' may control Music, click Allow: "
+             "that is the scheduled job asking for itself.")
     elif args.action == "remove":
         _say("Schedule removed." if schedule.remove() else "No schedule was installed.")
     else:
@@ -194,7 +226,7 @@ def cmd_schedule(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    """Find playlists Undertow did not create that look like earlier Undertow runs."""
+    """List playlists left by earlier Undertow setups; delete only what is confirmed."""
     home = config.ensure_home()
     cfg = config.load()
     state = State(home / "state.json")
@@ -205,29 +237,31 @@ def cmd_cleanup(args) -> int:
         if c["type"] == "library-playlist-folders" and c["name"].strip().lower() == cfg.folder.lower():
             for child in client.children(c["id"]):
                 if child["type"] == "library-playlists":
-                    found[child["id"]] = child["name"] + f"   (in the {cfg.folder} folder)"
+                    found[child["id"]] = f"{child['name']}   (in the {cfg.folder} folder)"
     for p in client.playlists():
         if "undertow" in p["name"].lower():
             found.setdefault(p["id"], p["name"])
     found = {i: n for i, n in found.items() if i not in mine}
     if not found:
-        _say("No leftover Undertow playlists found.")
+        _say("No leftover playlists found.")
         return 0
-    _say("Playlists that look like earlier Undertow runs (not created by this install):")
+    _say(f"Playlists in the {cfg.folder} folder or with 'undertow' in the name that this "
+         "install did not create. Some may be your own:")
     for name in found.values():
         _say(f"  {name}")
     if not args.delete:
-        _say("\nNothing deleted. To delete them, run: undertow cleanup --delete")
+        _say("\nNothing deleted. To go through them one by one, run: undertow cleanup --delete")
         return 0
-    if input(f"\nDelete these {len(found)} playlists for good? Type 'delete' to confirm: ") != "delete":
-        _say("Left alone.")
-        return 0
+    _say("\nDeleting a playlist cannot be undone. Answer for each one.")
     for pid, name in found.items():
+        if input(f"Delete '{name}'? [y/N] ").strip().lower() not in ("y", "yes"):
+            _say("  kept")
+            continue
         try:
             client.delete_playlist(pid)
-            _say(f"Deleted  {name}")
+            _say("  deleted")
         except AppleMusicError as e:
-            _say(f"Could not delete {name}: {e}")
+            _say(f"  could not delete: {e}")
     return 0
 
 

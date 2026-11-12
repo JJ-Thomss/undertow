@@ -10,6 +10,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config import home
@@ -32,6 +33,7 @@ def build_plist(hour: int = 6, minute: int = 30) -> dict:
         "EnvironmentVariables": {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "UNDERTOW_HOME": str(home()),
+            "UNDERTOW_SCHEDULED": "1",
         },
         "ProcessType": "Background",
     }
@@ -42,17 +44,27 @@ def _launchctl(*args: str) -> tuple[bool, str]:
     return p.returncode == 0, (p.stdout + p.stderr).strip()
 
 
-def install(hour: int = 6, minute: int = 30) -> str:
+def install(hour: int = 6, minute: int = 30, kick: bool = True) -> str:
     if sys.platform != "darwin":
         raise RuntimeError("Scheduling uses launchd, which only exists on macOS.")
     path = plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    (home() / "logs").mkdir(parents=True, exist_ok=True)  # launchd needs the log folder
     path.write_bytes(plistlib.dumps(build_plist(hour, minute)))
     domain = f"gui/{os.getuid()}"
     _launchctl("bootout", f"{domain}/{LABEL}")  # replace any earlier copy
-    ok, msg = _launchctl("bootstrap", domain, str(path))
-    if not ok:
+    for _ in range(5):  # the old copy can take a moment to unload
+        ok, msg = _launchctl("bootstrap", domain, str(path))
+        if ok:
+            break
+        time.sleep(1)
+    else:
         raise RuntimeError(f"launchctl could not load the job: {msg}")
+    # Run it once now. Not being due, it only asks the Music app a trivial
+    # question, which makes macOS show its permission prompt while you are here.
+    # Skipped when a rotation is due, so installing never starts one by surprise.
+    if kick:
+        _launchctl("kickstart", f"{domain}/{LABEL}")
     return str(path)
 
 

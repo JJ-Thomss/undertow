@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from .config import PLAYLIST_TITLES, Config
 from .library import norm_artist, norm_title, track_key
-from .sources import Deezer, ITunes, Song, SourceError
+from .sources import Deezer, ITunes, Song, SourceDown, SourceError
 from .state import State
 from .taste import Taste
 
@@ -35,13 +35,35 @@ _VARIANT = re.compile(
     re.I,
 )
 _DECORATION = re.compile(r"[\(\[]([^\)\]]*)[\)\]]|\s[-\u2013]\s(.*)$")
-_ALWAYS = re.compile(r"\b(karaoke|tribute to|made famous|live (at|in|from|on)\b|commentary)", re.I)
+# Albums are judged more gently: "Deluxe Version" or "Bonus Track Version" is
+# often the only edition Apple carries, and its songs are the normal recordings.
+_ALBUM_VARIANT = re.compile(
+    r"\b(live|karaoke|tribute|instrumentals?|demos?|remix(es|ed)?|commentary|acoustic|"
+    r"sessions?|rehearsals?)\b",
+    re.I,
+)
+_ALBUM_ALWAYS = re.compile(
+    r"\b(karaoke|tribute to|made famous|live (at|in|from|on)\b|commentary)", re.I)
+_SEASONAL = re.compile(r"\b(christmas|xmas|noel|santa claus)\b", re.I)
 
 
-def is_variant(text: str) -> bool:
-    if _ALWAYS.search(text):
+def _decorations(text: str) -> list[str]:
+    return [a or b or "" for a, b in _DECORATION.findall(text)]
+
+
+def is_variant(title: str) -> bool:
+    """An alternate take of a song, judged from its title."""
+    return any(_VARIANT.search(part) for part in _decorations(title))
+
+
+def is_variant_album(album: str) -> bool:
+    if _ALBUM_ALWAYS.search(album):
         return True
-    return any(_VARIANT.search(a or b or "") for a, b in _DECORATION.findall(text))
+    return any(_ALBUM_VARIANT.search(part) for part in _decorations(album))
+
+
+def is_seasonal(title: str, album: str) -> bool:
+    return bool(_SEASONAL.search(title) or _SEASONAL.search(album))
 
 
 @dataclass
@@ -49,6 +71,8 @@ class Pick:
     song: Song
     reason: str
     seeds: list[str]  # normalised seed artists credited if this gets saved
+    key: str = ""         # "artist|title" under the artist it was found through
+    artist_key: str = ""
 
 
 @dataclass
@@ -86,6 +110,7 @@ class Recommender:
         self.now, self.rng = now, rng
         self.progress = progress or (lambda msg: None)
         self.past_keys = state.recommended_keys()
+        self.past_ids = {h.get("song_id") for h in state.data["history"]}
         self.cooling = state.recent_artists(now, cfg.artist_cooldown_weeks)
         # Known artists come back sooner: there are far fewer of them.
         self.cooling_known = state.recent_artists(now, min(cfg.artist_cooldown_weeks, 2))
@@ -104,8 +129,10 @@ class Recommender:
             for a, score in pool
         ]
         chosen = weighted_sample(pool, weights, self.cfg.seeds_per_run, self.rng)
-        total = sum(s for _, s in chosen) or 1.0
-        self.seeds = [(a, s / total) for a, s in chosen]
+        # Square-root shares: one heavily played artist should lead, not drown
+        # out the agreement between several others.
+        total = sum(s ** 0.5 for _, s in chosen) or 1.0
+        self.seeds = [(a, (s ** 0.5) / total) for a, s in chosen]
         return self.seeds
 
     def similar_artists(self) -> dict[str, Candidate]:
@@ -116,8 +143,12 @@ class Recommender:
             try:
                 did = self.deezer.artist_id(name)
                 related = self.deezer.related(did) if did else []
+            except SourceDown:
+                raise
             except SourceError:
                 continue
+            if not did:
+                self.progress(f"no match for {name}; skipping it as a guide")
             for i, rel in enumerate(related):
                 key = norm_artist(rel["name"])
                 if not key or key in self.taste.blocked:
@@ -129,7 +160,7 @@ class Recommender:
             # Agreement between seeds matters more than one strong link, and
             # household names are damped: the listener has already heard them.
             agreement = 1 + 0.6 * (len(c.seeds) - 1)
-            familiarity = 1 + math.log10(1 + c.fans / 1_000_000)
+            familiarity = 1 + math.log10(1 + c.fans / 250_000)
             c.score = sum(c.seeds.values()) * agreement / familiarity
         return cands
 
@@ -144,6 +175,8 @@ class Recommender:
             self.progress(f"further out from {parent.name}")
             try:
                 related = self.deezer.related(parent.deezer_id)
+            except SourceDown:
+                raise
             except SourceError:
                 continue
             for i, rel in enumerate(related):
@@ -165,16 +198,18 @@ class Recommender:
         out = []
         for s in songs:
             title = norm_title(s.title)
-            key = track_key(artist, s.title)
-            if not title or title in seen_titles:
+            # Checked under both the artist looked up and the credited artist
+            # ("X & Y"), so a collaboration already owned is not offered again.
+            keys = {track_key(artist, s.title), track_key(s.artist, s.title)}
+            if not title or title in seen_titles or s.song_id in self.past_ids:
                 continue
-            if is_variant(s.title) or is_variant(s.album):
+            if is_variant(s.title) or is_variant_album(s.album) or is_seasonal(s.title, s.album):
                 continue
             if not 90 <= s.duration_s <= 600:
                 continue
             if s.explicit and not self.cfg.allow_explicit:
                 continue
-            if key in self.taste.track_keys or key in self.past_keys or key in self.used_keys:
+            if keys & self.taste.track_keys or keys & self.past_keys or keys & self.used_keys:
                 continue
             seen_titles.add(title)
             out.append(s)
@@ -184,13 +219,16 @@ class Recommender:
         try:
             aid = self.itunes.artist_id(artist)
             return self.eligible(self.itunes.songs(aid, recent=recent), artist) if aid else []
+        except SourceDown:
+            raise
         except SourceError:
             return []
 
     def take(self, plan: Plan, artist: str, song: Song, reason: str, seeds: list[str]) -> None:
-        plan.picks.append(Pick(song, reason, seeds))
+        key = track_key(artist, song.title)
+        plan.picks.append(Pick(song, reason, seeds, key, norm_artist(artist)))
         self.used_artists.add(norm_artist(artist))
-        self.used_keys.add(track_key(artist, song.title))
+        self.used_keys.update({key, track_key(song.artist, song.title)})
 
     def full(self, plan: Plan) -> bool:
         return len(plan.picks) >= self.cfg.tracks_per_playlist
@@ -225,12 +263,16 @@ class Recommender:
                 s = songs[0]
                 self.take(plan, name, s, f"New from {name} ({s.released:%b %Y})", [artist])
         # Top up with new releases from the closest artists not in the library.
-        ranked = sorted(similar.items(), key=lambda kc: -kc[1].score)
+        ranked = sorted(
+            (
+                (k, c) for k, c in similar.items()
+                if not self.taste.knows(c.name) and k not in self.cooling and k not in self.used_artists
+            ),
+            key=lambda kc: -kc[1].score,
+        )
         for key, c in ranked[:30]:
             if self.full(plan):
                 break
-            if self.taste.knows(c.name) or key in self.cooling or key in self.used_artists:
-                continue
             self.progress(f"new releases: {c.name}")
             songs = [s for s in self.songs_for(c.name, recent=True) if s.released and s.released >= cutoff]
             if songs:

@@ -22,6 +22,11 @@ class SourceError(RuntimeError):
     pass
 
 
+class SourceDown(SourceError):
+    """A data source stayed unreachable through every retry. The run should
+    stop rather than grind through hundreds more lookups that will also fail."""
+
+
 class Cache:
     """Small JSON-on-disk cache so reruns and later weeks reuse lookups."""
 
@@ -53,7 +58,7 @@ class Http:
     it out, then carry on more slowly for the rest of the run.
     """
 
-    WAITS = (60, 120, 240, 300, 300)
+    WAITS = (60, 120, 240, 300)
 
     def __init__(self, session=None, sleep=time.sleep, clock=time.monotonic):
         self._own_session = session is None
@@ -84,7 +89,7 @@ class Http:
                 r = self.session.get(url, params=params, timeout=30)
             except requests.RequestException as e:
                 if backoff is None:
-                    raise SourceError(f"{host_key} is unreachable: {e}") from e
+                    raise SourceDown(f"{host_key} is unreachable: {e}") from e
                 self._pause(host_key, "is unreachable", min(backoff, 60))
                 continue
             data = None
@@ -104,7 +109,10 @@ class Http:
             # Deezer's limit resets within seconds; Apple's takes minutes.
             self._pause(host_key, f"is rate limiting (HTTP {r.status_code})",
                         5 * (attempt + 1) if host_key == "deezer" else backoff)
-        raise SourceError(f"{host_key} kept refusing requests for {url}")
+        raise SourceDown(
+            f"{host_key} kept refusing requests. Nothing was changed; lookups so far are "
+            f"saved, so trying again later picks up where this stopped."
+        )
 
 
 @dataclass
@@ -132,6 +140,8 @@ class Deezer:
         if hit is not None:
             return hit
         data = self.http.get_json("deezer", self.BASE + path, params, interval=0.15)
+        if "error" in data:  # a one-off error must not be remembered for weeks
+            raise SourceError(f"Deezer could not answer {path}: {data['error']}")
         self.cache.put(key, data)
         return data
 
@@ -167,7 +177,8 @@ class ITunes:
         if hit is not None:
             return hit
         data = self.http.get_json("itunes", self.BASE + path, params, interval=self.interval)
-        self.cache.put(key, data)
+        if data.get("results"):  # an empty answer may be a blip; ask again next time
+            self.cache.put(key, data)
         return data
 
     def artist_id(self, name: str) -> int | None:

@@ -1,4 +1,4 @@
-"""Small jobs done through the Music app itself on macOS."""
+"""Small macOS jobs: notifications and the Music permission check."""
 
 from __future__ import annotations
 
@@ -22,16 +22,10 @@ def _osascript(script: str, timeout: int = 120) -> tuple[bool, str]:
     return p.returncode == 0, (p.stdout if p.returncode == 0 else p.stderr).strip()
 
 
-def delete_playlists_named(name: str) -> tuple[bool, str]:
-    """Backstop for deletion: remove playlists with exactly this name."""
-    q = _quote(name)
-    return _osascript(
-        f'tell application "Music"\n'
-        f"  set n to count of (every user playlist whose name is {q})\n"
-        f"  if n > 0 then delete (every user playlist whose name is {q})\n"
-        f"  return n\n"
-        f"end tell"
-    )
+def ping() -> tuple[bool, str]:
+    """Ask the Music app one trivial question. Its only purpose is to make macOS
+    show the "allow control of Music" prompt while someone is there to answer."""
+    return _osascript('tell application "Music" to get name of library playlist 1', timeout=120)
 
 
 def notify(title: str, message: str) -> None:
