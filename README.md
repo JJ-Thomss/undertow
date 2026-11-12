@@ -48,7 +48,7 @@ week is up. The Undertow playlists themselves are replaced.
    ```
 
    ```bash
-   git clone https://github.com/JJ-Thomss/undertow.git ~/undertow-src
+   git clone -b claude/peaceful-ride-50sue4 https://github.com/JJ-Thomss/undertow.git ~/undertow-src
    ```
 
    ```bash
@@ -90,9 +90,10 @@ week is up. The Undertow playlists themselves are replaced.
    undertow schedule install
    ```
 
-The first `preview` or `run` takes 15 to 30 minutes, because Apple's free
-catalogue lookup allows about 20 requests a minute. Results are saved, so
-later runs are quicker.
+The first `preview` or `run` is slow (expect half an hour or more), because
+Apple's free catalogue lookup pauses callers for a few minutes after a burst
+of requests. Undertow waits those pauses out. Results are saved, so later runs
+are quicker. Leave it running; the scheduled runs happen in the background.
 
 ## Everyday use
 

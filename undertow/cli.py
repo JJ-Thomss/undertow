@@ -56,8 +56,8 @@ def _build(args, cfg, home, state):
             "saves. To fix it, turn off Music > Settings > Advanced > "
             "'Add songs to Library when adding to playlists'."
         )
-    _say("Choosing songs. The first run takes 15 to 30 minutes because the catalogue "
-         "lookups are rate limited; later runs reuse saved lookups.")
+    _say("Choosing songs. The first run is slow (half an hour or more) because the "
+         "catalogue lookups are rate limited; later runs reuse saved lookups.")
     deezer, itunes = _sources(cfg, home)
     plans = plan_rotation(taste, cfg, state, deezer, itunes, _now(), _progress,
                           reroll=getattr(args, "reroll", 0))
