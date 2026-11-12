@@ -49,7 +49,7 @@ def apply_rotation(plans: list[Plan], cfg: Config, state: State, client: AppleMu
     state.data["generations"].append(generation)
 
     for plan in plans:
-        if len(plan.picks) < MIN_TRACKS:
+        if len(plan.picks) < min(MIN_TRACKS, cfg.tracks_per_playlist):
             out.skipped.append(f"{plan.title} (only {len(plan.picks)} songs found)")
             continue
         name = f"{plan.title} · {day_label(now)}"

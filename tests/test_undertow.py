@@ -371,3 +371,59 @@ def test_schedule_runs_this_install_daily():
     plist = build_plist(6, 30)
     assert plist["ProgramArguments"][1:] == ["-m", "undertow", "run"]
     assert plist["StartCalendarInterval"] == {"Hour": 6, "Minute": 30}
+
+
+# --- the whole command, end to end with stand-ins --------------------------
+
+def test_run_command_rotates_and_then_waits_until_due(tmp_path, monkeypatch, capsys):
+    import json
+
+    from undertow import cli
+
+    recent = (NOW - timedelta(days=10)).isoformat()
+    rows = [("Loved One", "Alpha", "First", 40, True), ("Other", "Alpha", "First", 10, False),
+            ("Okay", "Beta", "B1", 5, False), ("Old", "Gamma", "G1", 9, False)]
+    dump = {
+        "name": [r[0] for r in rows], "artist": [r[1] for r in rows],
+        "albumArtist": [r[1] for r in rows], "album": [r[2] for r in rows],
+        "genre": [""] * 4, "playedCount": [r[3] for r in rows], "skippedCount": [0] * 4,
+        "favorited": [r[4] for r in rows], "disliked": [False] * 4,
+        "dateAdded": [recent] * 4, "playedDate": [recent] * 4, "mediaKind": ["song"] * 4,
+    }
+    lib = tmp_path / "lib.json"
+    lib.write_text(json.dumps(dump))
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text('playlists = ["kindred"]\ntracks_per_playlist = 3\n')
+    monkeypatch.setenv("UNDERTOW_HOME", str(home))
+
+    client = FakeClient()
+    client.storefront = lambda: "ca"
+    itunes = FakeITunes()
+    extras = [f"N{i}" for i in range(4, 12)]  # enough unknown artists for two rotations
+    for extra in extras:
+        FakeDeezer.RELATED["Alpha"].append(extra)
+        itunes.catalogue[extra] = [song(extra, f"{extra} Song")]
+    monkeypatch.setattr(cli, "AppleMusic", lambda: client)
+    monkeypatch.setattr(cli, "_sources", lambda cfg, h: (FakeDeezer(), itunes))
+    monkeypatch.setattr(cli.musicapp, "notify", lambda *a: None)
+    try:
+        assert cli.main(["run", "--library-json", str(lib)]) == 0
+    finally:
+        pass
+    out = capsys.readouterr().out
+    assert "Created  Kindred" in out
+    created = [c for c in client.calls if c[0] == "create"]
+    assert len(created) == 1 and len(created[0][3]) == 3
+    assert list((home / "reports").glob("*.md"))
+
+    assert cli.main(["run", "--library-json", str(lib)]) == 0   # same day: nothing to do
+    assert "Not due yet" in capsys.readouterr().out
+    assert len([c for c in client.calls if c[0] == "create"]) == 1
+
+    try:
+        assert cli.main(["run", "--force", "--library-json", str(lib)]) == 0
+    finally:
+        del FakeDeezer.RELATED["Alpha"][-len(extras):]
+    assert [c[0] for c in client.calls].count("delete") == 1     # the first set was removed
+    assert len(client.live) == 2                                 # new playlist + the stranger
